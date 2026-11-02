@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import copy
+from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
 from types import UnionType
@@ -802,6 +803,232 @@ def _messages_without_structural_payload(
     ]
 
 
+def _is_text_part(part: Mapping[str, Any]) -> bool:
+    part_type = part.get("type")
+    return part_type in _TEXT_PART_TYPES or (
+        part_type is None and isinstance(part.get("text"), str)
+    )
+
+
+def _blank_text_payload(message: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy ``message`` with content text cleared and everything else kept."""
+    updated = dict(message)
+    content = updated.get("content")
+    if isinstance(content, str):
+        updated["content"] = ""
+        return updated
+    if isinstance(content, list):
+        parts: list[Any] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append("")
+                continue
+            if isinstance(part, dict) and _is_text_part(part):
+                blank = dict(part)
+                if isinstance(blank.get("text"), str):
+                    blank["text"] = ""
+                parts.append(blank)
+                continue
+            parts.append(part)
+        updated["content"] = parts
+    return updated
+
+
+def _messages_without_text_payload(
+    conversation: Sequence[Mapping[str, Any]],
+    indexes: set[int],
+) -> list[Mapping[str, Any]]:
+    return [
+        _blank_text_payload(message) if index in indexes else message
+        for index, message in enumerate(conversation)
+    ]
+
+
+def _coerce_media_url(value: Any) -> str | None:
+    if isinstance(value, str):
+        url = value.strip()
+    elif isinstance(value, dict):
+        inner = value.get("url")
+        url = inner.strip() if isinstance(inner, str) else ""
+    else:
+        return None
+    if len(url) < 8:
+        return None
+    return url
+
+
+def _media_urls(message: Mapping[str, Any]) -> list[str]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    urls: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        for key in ("image_url", "audio_url", "video_url"):
+            url = _coerce_media_url(part.get(key))
+            if url is not None:
+                urls.append(url)
+        if part.get("type") in {"image", "image_url", "audio", "audio_url", "video"}:
+            url = _coerce_media_url(part.get("url"))
+            if url is not None:
+                urls.append(url)
+    return urls
+
+
+def _media_urls_explain_deletion(
+    conversation: Sequence[Mapping[str, Any]],
+    subgroup: Sequence[tuple[int, str]],
+    baseline: str,
+    stripped: str,
+) -> bool:
+    """True when every suspect's media URL disappeared with its payload.
+
+    One shared occurrence is not enough for several messages. A URL that is
+    a prefix of another is left to the deletion check, so ``/1`` is not
+    counted inside ``/10``.
+    """
+    needed: Counter[str] = Counter()
+    for index, _role in subgroup:
+        urls = {url.lower() for url in _media_urls(conversation[index])}
+        if not urls:
+            return False
+        for url in urls:
+            needed[url] += 1
+    folded_urls = list(needed)
+    if any(
+        left != right and left in right for left in folded_urls for right in folded_urls
+    ):
+        return False
+    baseline_folded = baseline.lower()
+    stripped_folded = stripped.lower()
+    return all(
+        baseline_folded.count(url) - stripped_folded.count(url) >= count
+        for url, count in needed.items()
+    )
+
+
+def _single_insertion(full: str, stripped: str) -> str | None:
+    """Return the one contiguous span ``stripped`` is missing from ``full``."""
+    if len(full) <= len(stripped):
+        return None
+    prefix = 0
+    while prefix < len(stripped) and full[prefix] == stripped[prefix]:
+        prefix += 1
+    suffix = 0
+    suffix_budget = len(stripped) - prefix
+    while suffix < suffix_budget and full[-1 - suffix] == stripped[-1 - suffix]:
+        suffix += 1
+    end = len(full) - suffix if suffix else len(full)
+    inserted = full[prefix:end]
+    if not inserted:
+        return None
+    rebuilt = full[:prefix] + (full[-suffix:] if suffix else "")
+    if rebuilt != stripped:
+        return None
+    return inserted
+
+
+def _common_suffix(left: str, right: str) -> str:
+    limit = min(len(left), len(right))
+    matched = 0
+    while matched < limit and left[-1 - matched] == right[-1 - matched]:
+        matched += 1
+    if matched == 0:
+        return ""
+    return left[-matched:]
+
+
+def _occurrence_delta(full: str, stripped: str, unit: str) -> int | None:
+    if not unit:
+        return None
+    delta = full.count(unit) - stripped.count(unit)
+    if delta < 0:
+        return None
+    return delta
+
+
+def _shared_token_explains(
+    first: str,
+    second: str,
+    baseline: str,
+    alternate: str,
+    count: int,
+) -> bool:
+    """True when one piece of both insertions was removed ``count`` times.
+
+    The two insertions are whatever a single-message strip deletes. They
+    can be rotated (``wizard0:<image>`` versus ``0:<image>wizard``) when
+    neighboring turns share a prefix. A piece that occurs once in each
+    insertion and ``count`` times in the group deletion is that turn's
+    payload, including a shared ``<image>`` suffix.
+    """
+    if count < 1 or len(first) > 512 or len(second) > 512:
+        return False
+    suffix = _common_suffix(first, second)
+    if (
+        len(suffix) >= 6
+        and first.count(suffix) == 1
+        and second.count(suffix) == 1
+        and _occurrence_delta(baseline, alternate, suffix) == count
+    ):
+        return True
+    seen: set[str] = set()
+    shortest = min(len(first), len(second))
+    for size in range(shortest, 5, -1):
+        for start in range(len(first) - size + 1):
+            token = first[start : start + size]
+            if token in seen:
+                continue
+            seen.add(token)
+            if first.count(token) != 1 or second.count(token) != 1:
+                continue
+            if _occurrence_delta(baseline, alternate, token) == count:
+                return True
+    return False
+
+
+def _payloads_all_rendered(
+    conversation: Sequence[Mapping[str, Any]],
+    subgroup: Sequence[tuple[int, str]],
+    alternate: str,
+    baseline: str,
+    without: Callable[[set[int]], Sequence[Mapping[str, Any]]],
+    render_text: Callable[[Sequence[Mapping[str, Any]]], str],
+) -> bool:
+    """Whether every member of ``subgroup`` still contributes to ``baseline``.
+
+    Stripping the whole group already changed the prompt. That only proves
+    some member contributed. Count the deletion instead of splitting: media
+    URLs that vanish, one repeated insertion, or a piece shared by two
+    per-message insertions (the ``<image>`` in ``wizard0:<image>``). A
+    member whose own removal leaves the prompt unchanged is not explained
+    that way, so the caller still splits.
+    """
+    if len(subgroup) < 2:
+        return False
+    if _media_urls_explain_deletion(conversation, subgroup, baseline, alternate):
+        return True
+
+    def marginal(index: int) -> str | None:
+        rendered = _render_probe_text(render_text, without({index}))
+        if not isinstance(rendered, str) or rendered == baseline:
+            return None
+        return _single_insertion(baseline, rendered)
+
+    first = marginal(subgroup[0][0])
+    if first is None:
+        return False
+    if _occurrence_delta(baseline, alternate, first) == len(subgroup):
+        return True
+    second = marginal(subgroup[-1][0])
+    if second is None:
+        return False
+    if _occurrence_delta(baseline, alternate, second) == len(subgroup):
+        return True
+    return _shared_token_explains(first, second, baseline, alternate, len(subgroup))
+
+
 def _stamp_tool_call_probe(message: dict[str, Any], token: str) -> bool:
     """Append ``token`` to tool-call names this message already has.
 
@@ -872,20 +1099,25 @@ def _indexes_dropped_by_omission(
     render_text: Callable[[Sequence[Mapping[str, Any]]], str],
     *,
     strip_payload: bool = False,
+    strip_text: bool = False,
 ) -> set[int]:
-    """Indexes whose structural payload leaves the rendered prompt unchanged.
+    """Indexes whose removal leaves the rendered prompt unchanged.
 
     Every suspect is covered by one render. An unchanged prompt means each
     of them was omitted. If the prompt changes, tool-call names are stamped
     and checked in a second render so messages the template actually prints
-    are cleared together. Only a mixed remainder is split, and a fully
+    are cleared together. A group that still changes the prompt is kept
+    when that change is one repeated insertion, or a shared suffix of two
+    per-message insertions, so rendered image turns are not split per
+    message. Only a remainder that still looks mixed is split, and a fully
     omitted subgroup is still decided by one render.
 
     When ``strip_payload`` is true, tool calls and multimodal parts are
     removed but the message stays at the same index. That catches a tool
     call dropped beside echoed text, and keeps neighbor lookups stable.
-    When false, the whole message is removed. The text-probe fallback uses
-    that to see whether the turn itself was omitted.
+    When ``strip_text`` is true, only content text is cleared. A missing
+    probe marker is not a drop until that happens and the prompt stays the
+    same. When both are false, the whole message is removed.
     """
     try:
         baseline = render_text(conversation)
@@ -906,6 +1138,8 @@ def _indexes_dropped_by_omission(
         return set()
 
     def without(indexes: set[int]) -> list[Mapping[str, Any]]:
+        if strip_text:
+            return _messages_without_text_payload(conversation, indexes)
         if strip_payload:
             return _messages_without_structural_payload(conversation, indexes)
         return _messages_without(conversation, indexes)
@@ -931,6 +1165,17 @@ def _indexes_dropped_by_omission(
         # the one that contributed. A single message that changes the
         # prompt, or whose removal fails to render, is not a silent drop.
         if len(subgroup) == 1:
+            return set()
+        # A repeated deletion explains every member. Splitting here would
+        # re-render once per image when each image changes the prompt.
+        if isinstance(alternate, str) and _payloads_all_rendered(
+            conversation,
+            subgroup,
+            alternate,
+            baseline,
+            without,
+            render_text,
+        ):
             return set()
         mid = len(subgroup) // 2
         return dropped_in(subgroup[:mid]) | dropped_in(subgroup[mid:])
@@ -991,9 +1236,10 @@ def assert_chat_template_rendered_messages(
     that role can also reach an output of message content. A header with
     no such content path is still probed. Any other non-standard role is
     probed: a unique token is appended to its content and the conversation
-    is rendered again. The turn is rejected only when it adds nothing to
-    the prompt. A rendered tool call or image keeps the turn, and echoed
-    text does not hide a dropped tool call or image.
+    is rendered again. A missing token is not enough. The turn is rejected
+    only when removing the original text leaves the prompt unchanged. A
+    rendered tool call or image keeps the turn, and echoed text does not
+    hide a dropped tool call or image.
 
     Standard roles from the OpenAI message schema (``system``, ``user``,
     ``assistant``, ``tool``, ``developer``, and legacy ``function``) are
@@ -1136,4 +1382,17 @@ def _indexes_dropped_by_text_probe(
         return _indexes_dropped_by_omission(conversation, suspects, render_text)
 
     folded = rendered.lower()
-    return {index for index, token in tokens if token.lower() not in folded}
+    missing_ids = {index for index, token in tokens if token.lower() not in folded}
+    if not missing_ids:
+        return set()
+    # The marker can be clipped (`content[:5]`) while the original text is
+    # still in the prompt. Clear that text and see if the prompt changes.
+    missing = [(index, role) for index, role in suspects if index in missing_ids]
+    if not missing:
+        return set()
+    return _indexes_dropped_by_omission(
+        conversation,
+        missing,
+        render_text,
+        strip_text=True,
+    )
